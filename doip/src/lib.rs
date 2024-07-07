@@ -1,5 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use core::mem;
+use std::fmt::Debug;
 use std::io::{Read, Seek, Write};
 use thiserror::Error;
 
@@ -217,6 +218,7 @@ impl DoIpHeader {
     }
 }
 
+#[derive(Debug)]
 pub struct DoIpMessage {
     pub header: DoIpHeader,
     pub payload: Vec<u8>,
@@ -591,7 +593,10 @@ pub struct DiagnosticMessage {
 }
 
 impl DiagnosticMessage {
-    pub fn read<T: Read + Seek>(reader: &mut T, payload_length: u32) -> Result<Self, DoIpError> {
+    pub fn read<T: Read + Seek + Debug>(
+        reader: &mut T,
+        payload_length: u32,
+    ) -> Result<Self, DoIpError> {
         let mut source_address = [0x00u8; 2];
         reader.read_exact(&mut source_address)?;
 
@@ -600,7 +605,9 @@ impl DiagnosticMessage {
 
         let user_data_len = payload_length - 4; // 4 == source + target address
         let mut user_data = Vec::with_capacity(user_data_len as usize);
-        reader.read_exact(&mut user_data)?;
+        reader
+            .take(user_data_len.into())
+            .read_to_end(&mut user_data)?;
 
         Ok(Self {
             source_address,

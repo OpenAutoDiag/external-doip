@@ -6,8 +6,7 @@ use futures::{SinkExt, StreamExt};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tls_api::TlsStream;
-use tokio::net::{TcpSocket, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio_util::codec::Framed;
 use tokio_util::udp::UdpFramed;
 
@@ -29,7 +28,7 @@ pub struct DoIpClient {
     /// and 3496 or [TCP_DATA_TLS_PORT`] for TLS connections.
     pub target_addr: SocketAddr,
     pub target_logical_address: u16,
-    tls_stream: Framed<TlsStream, DoIpCodec>,
+    tcp_stream: Framed<TcpStream, DoIpCodec>,
     udp_socket: UdpSocket,
 }
 
@@ -39,8 +38,6 @@ impl DoIpClient {
     pub async fn connect<C: tls_api::TlsConnector, T: Into<IpAddr>>(
         target_ip_addr: T,
         target_logical_address: u16,
-        tls_connector: C,
-        domain: &str,
     ) -> Result<Self, DoIpTokioError> {
         let target_addr = SocketAddr::from((target_ip_addr, TCP_DATA_TLS_PORT));
         let client_addr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
@@ -53,14 +50,10 @@ impl DoIpClient {
             client_logical_addr,
         };
 
-        Self::connect_with(&opts, tls_connector, domain).await
+        Self::connect_with(&opts).await
     }
 
-    pub async fn connect_with<C: tls_api::TlsConnector>(
-        opts: &DoIpClientOptions,
-        tls_connector: C,
-        domain: &str,
-    ) -> Result<Self, DoIpTokioError> {
+    pub async fn connect_with(opts: &DoIpClientOptions) -> Result<Self, DoIpTokioError> {
         if opts.client_logical_addr < 0x0E00 || opts.client_logical_addr > 0x0FFF {
             return Err(DoIpTokioError::InvalidClientLogicalAddr(
                 opts.client_logical_addr,
@@ -74,8 +67,7 @@ impl DoIpClient {
         tcp_socket.set_reuseaddr(true)?;
 
         let tcp_stream = tcp_socket.connect(opts.target_addr).await?;
-        let tls_stream = tls_connector.connect(domain, tcp_stream).await?;
-        let tls_stream = Framed::new(tls_stream, DoIpCodec {});
+        let tcp_stream = Framed::new(tcp_stream, DoIpCodec {});
 
         // Tokio's UdpSocket does not directly offer "set_reuse_address", go with socket2
         let udp_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -90,7 +82,7 @@ impl DoIpClient {
         Ok(Self {
             target_addr: opts.target_addr,
             target_logical_address: opts.target_logical_address,
-            tls_stream,
+            tcp_stream,
             udp_socket,
         })
     }
@@ -236,7 +228,8 @@ impl DoIpClient {
         source_address: [u8; 2],
         target_address: [u8; 2],
         user_data: Vec<u8>,
-    ) -> Result<DiagnosticMessagePositiveAck, DoIpTokioError> {
+        timeout: std::time::Duration,
+    ) -> Result<DiagnosticMessage, DoIpTokioError> {
         let mut payload = Vec::with_capacity(2 + 2 + user_data.len());
 
         let diagnostic_message = DiagnosticMessage {
@@ -256,7 +249,7 @@ impl DoIpClient {
                     pt == PayloadType::DiagnosticMessagePositiveAcknowledgement
                         || pt == PayloadType::DiagnosticMessageNegativeAcknowledgement
                 },
-                7,
+                5,
             )
             .await?;
 
@@ -275,7 +268,27 @@ impl DoIpClient {
                 )?;
                 Err(DoIpTokioError::DiagnosticMessageNegativeAck(nack))
             }
-            _ => panic!("Should not occur due previous payload type check"),
+            _ => Err(DoIpTokioError::Parse(DoIpError::UnexpectedPayloadType {
+                value: message.header.payload_type,
+            })),
+        }?;
+
+        let message = match tokio::time::timeout(timeout, self.read_tcp_message()).await {
+            Ok(message) => message,
+            Err(_) => return Err(DoIpTokioError::Timeout),
+        }?;
+
+        match message.header.payload_type {
+            PayloadType::DiagnosticMessage => {
+                let diag_msg = DiagnosticMessage::read(
+                    &mut Cursor::new(message.payload),
+                    message.header.payload_length,
+                )?;
+                Ok(diag_msg)
+            }
+            _ => Err(DoIpTokioError::Parse(DoIpError::UnexpectedPayloadType {
+                value: message.header.payload_type,
+            })),
         }
     }
 
@@ -297,12 +310,12 @@ impl DoIpClient {
         header: &DoIpHeader,
         payload: &[u8],
     ) -> Result<(), DoIpTokioError> {
-        self.tls_stream.send((header, payload)).await?;
+        self.tcp_stream.send((header, payload)).await?;
         Ok(())
     }
 
     async fn read_tcp_message(&mut self) -> Result<DoIpMessage, DoIpTokioError> {
-        let (header, payload) = self.tls_stream.next().await.unwrap()?;
+        let (header, payload) = self.tcp_stream.next().await.unwrap()?;
 
         if header.payload_type == PayloadType::GenericDoIpHeaderNegativeAcknowledge {
             let nack_code = NegativeAckCode::read(&mut Cursor::new(payload))?;

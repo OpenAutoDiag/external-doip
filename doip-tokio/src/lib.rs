@@ -88,6 +88,8 @@ pub enum DoIpTokioError {
     Parse(#[from] DoIpError),
     #[error("Diagnostic message negative acknowledgement code: {0:?}")]
     DiagnosticMessageNegativeAck(DiagnosticMessageNegativeAck),
+    #[error("Timeout waiting for response")]
+    Timeout,
 }
 
 /// Stream of vehicle streams / vehicle identification responses.
